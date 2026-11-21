@@ -1,4 +1,4 @@
-"""Futurepath AI — backend API.
+"""Futurepath AI — backend API with email + password accounts.
 
 Run:  uvicorn main:app --reload
 Docs: http://127.0.0.1:8000/docs
@@ -9,13 +9,15 @@ import os
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 import core
-from data import CAREERS, SECTORS
+from data import SECTORS
+
+COOKIE = "fp_session"
 
 
 @asynccontextmanager
@@ -24,18 +26,61 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Futurepath AI", version="1.0.0", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Futurepath AI", version="2.0.0", lifespan=lifespan)
+
+# The app is served from this same server, so no CORS is needed. Only set CORS_ORIGINS if you
+# host the frontend on a different address (then also expect cookie limits across sites).
+_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if _origins:
+    app.add_middleware(CORSMiddleware, allow_origins=_origins, allow_credentials=True,
+                       allow_methods=["*"], allow_headers=["*"])
+
+
+# --------------------------------------------------------------------------- #
+# Login helpers
+# --------------------------------------------------------------------------- #
+def current_user(request: Request) -> dict:
+    """The signed-in student, from the session cookie. Raises 401 if there isn't one."""
+    token = request.cookies.get(COOKIE)
+    if token:
+        with core.db() as conn:
+            user = core.user_for_token(conn, token)
+        if user:
+            return user
+    raise HTTPException(401, "Please sign in")
+
+
+def _set_session_cookie(request: Request, response: Response, token: str) -> None:
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    response.set_cookie(
+        COOKIE, token, max_age=core.SESSION_DAYS * 86400, path="/",
+        httponly=True, samesite="lax", secure=(proto == "https"),
+    )
+
+
+def _limit(key: str, limit: int, window: int, message: str) -> None:
+    if not core.allow(key, limit, window):
+        raise HTTPException(429, message)
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
 
 
 # --------------------------------------------------------------------------- #
 # Request models
 # --------------------------------------------------------------------------- #
+class SignupIn(BaseModel):
+    name: str = Field("", max_length=200)
+    email: str = Field("", max_length=320)
+    password: str = Field("", max_length=500)
+
+
+class LoginIn(BaseModel):
+    email: str = Field("", max_length=320)
+    password: str = Field("", max_length=500)
+
+
 class ProfileIn(BaseModel):
     name: str = Field("Student", max_length=100)
     year: str = Field("Class 12", max_length=40)
@@ -47,7 +92,7 @@ class ProfileIn(BaseModel):
     @field_validator("name")
     @classmethod
     def _name(cls, v: str) -> str:
-        return v.strip() or "Student"  # same fallback the frontend uses
+        return v.strip() or "Student"
 
     @field_validator("subjects", "location", "interests", "year")
     @classmethod
@@ -60,7 +105,7 @@ class ProfileIn(BaseModel):
         unknown = [s for s in v if s not in core.SECTOR_BY_ID]
         if unknown:
             raise ValueError(f"Unknown sector id(s): {', '.join(unknown)}")
-        return list(dict.fromkeys(v))  # de-duplicate, keep order
+        return list(dict.fromkeys(v))
 
 
 class ChatTurn(BaseModel):
@@ -71,7 +116,7 @@ class ChatTurn(BaseModel):
 class ChatIn(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
     history: list[ChatTurn] = Field(default_factory=list)
-    save_advice: bool = True  # the frontend saves every advisor reply to "Saved advice"
+    save_advice: bool = True
 
     @field_validator("message")
     @classmethod
@@ -80,6 +125,64 @@ class ChatIn(BaseModel):
         if not v:
             raise ValueError("message must not be blank")
         return v
+
+
+# --------------------------------------------------------------------------- #
+# Accounts
+# --------------------------------------------------------------------------- #
+@app.post("/api/auth/signup")
+def signup(body: SignupIn, request: Request, response: Response):
+    name = body.name.strip()
+    email = core.normalize_email(body.email)
+    if not name:
+        raise HTTPException(400, "Please tell us your name.")
+    if len(name) > 100:
+        raise HTTPException(400, "That name is too long.")
+    if not core.EMAIL_RE.match(email) or len(email) > 254:
+        raise HTTPException(400, "Please enter a valid email address.")
+    if len(body.password) < 8:
+        raise HTTPException(400, "Your password needs at least 8 characters.")
+    if len(body.password) > 128:
+        raise HTTPException(400, "That password is too long (maximum 128 characters).")
+    _limit(f"signup:{_client_ip(request)}", 10, 3600, "Too many sign-ups from this network. Please try again later.")
+
+    with core.db() as conn:
+        try:
+            user = core.create_user(conn, email, body.password, name)
+        except core.EmailTaken:
+            raise HTTPException(409, "An account with this email already exists. Try signing in.") from None
+        token = core.create_session(conn, user["id"])
+    _set_session_cookie(request, response, token)
+    return user
+
+
+@app.post("/api/auth/login")
+def login(body: LoginIn, request: Request, response: Response):
+    email = core.normalize_email(body.email)
+    _limit(f"login:{_client_ip(request)}|{email}", 10, 600,
+           "Too many attempts. Please wait a few minutes and try again.")
+    with core.db() as conn:
+        user = core.authenticate(conn, email, body.password)
+        if user is None:
+            raise HTTPException(401, "Incorrect email or password.")
+        token = core.create_session(conn, user["id"])
+    _set_session_cookie(request, response, token)
+    return user
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response):
+    token = request.cookies.get(COOKIE)
+    if token:
+        with core.db() as conn:
+            core.end_session(conn, token)
+    response.delete_cookie(COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def me(user: dict = Depends(current_user)):
+    return user
 
 
 # --------------------------------------------------------------------------- #
@@ -99,34 +202,36 @@ def list_sectors():
 def list_careers(
     sector: str | None = Query(None, description="Sector id, or 'all'"),
     q: str | None = Query(None, description="Search title, exam, description or sector name"),
+    user: dict = Depends(current_user),
 ):
     if sector and sector != "all" and sector not in core.SECTOR_BY_ID:
         raise HTTPException(404, f"Unknown sector '{sector}'")
     with core.db() as conn:
-        saved = set(core.saved_ids(conn))
+        saved = set(core.saved_ids(conn, user["id"]))
     return [core.career_out(c, saved) for c in core.search_careers(sector, q)]
 
 
 @app.get("/api/careers/{career_id}")
-def get_career(career_id: str):
+def get_career(career_id: str, user: dict = Depends(current_user)):
     career = core.CAREER_BY_ID.get(career_id)
     if not career:
         raise HTTPException(404, "Career not found")
     with core.db() as conn:
-        saved = set(core.saved_ids(conn))
+        saved = set(core.saved_ids(conn, user["id"]))
     return core.career_out(career, saved)
 
 
 # --------------------------------------------------------------------------- #
-# Home dashboard
+# Home dashboard and profile
 # --------------------------------------------------------------------------- #
 @app.get("/api/dashboard")
-def dashboard():
+def dashboard(user: dict = Depends(current_user)):
     with core.db() as conn:
-        profile = core.get_profile(conn)
-        saved = core.saved_ids(conn)
-        advice_count = conn.execute("SELECT COUNT(*) FROM advice").fetchone()[0]
-    first_name = profile["name"].split()[0] if profile["name"].split() else "Student"
+        profile = core.get_profile(conn, user["id"])
+        saved = core.saved_ids(conn, user["id"])
+        advice_count = core.count_advice(conn, user["id"])
+    words = profile["name"].split()
+    first_name = words[0] if words else "Student"
     return {
         "name": profile["name"],
         "first_name": first_name,
@@ -138,89 +243,89 @@ def dashboard():
     }
 
 
-# --------------------------------------------------------------------------- #
-# Profile
-# --------------------------------------------------------------------------- #
 @app.get("/api/profile")
-def read_profile():
+def read_profile(user: dict = Depends(current_user)):
     with core.db() as conn:
-        profile = core.get_profile(conn)
-        return {**profile, "saved_count": len(core.saved_ids(conn)),
-                "advice_count": conn.execute("SELECT COUNT(*) FROM advice").fetchone()[0],
-                "completeness": core.profile_completeness(profile)}
+        profile = core.get_profile(conn, user["id"])
+        return {
+            **profile,
+            "email": user["email"],
+            "saved_count": len(core.saved_ids(conn, user["id"])),
+            "advice_count": core.count_advice(conn, user["id"]),
+            "completeness": core.profile_completeness(profile),
+        }
 
 
 @app.put("/api/profile")
-def update_profile(body: ProfileIn):
+def update_profile(body: ProfileIn, user: dict = Depends(current_user)):
     with core.db() as conn:
-        profile = core.save_profile(conn, body.model_dump())
+        profile = core.save_profile(conn, user["id"], body.model_dump())
         return {**profile, "completeness": core.profile_completeness(profile)}
 
 
 @app.put("/api/profile/sectors/{sector_id}")
-def toggle_profile_sector(sector_id: str):
+def toggle_profile_sector(sector_id: str, user: dict = Depends(current_user)):
     """Add the sector to the student's interests, or remove it if already there."""
     if sector_id not in core.SECTOR_BY_ID:
         raise HTTPException(404, "Unknown sector")
     with core.db() as conn:
-        profile = core.get_profile(conn)
+        profile = core.get_profile(conn, user["id"])
         sectors = profile["sectors"]
         profile["sectors"] = [s for s in sectors if s != sector_id] if sector_id in sectors else [*sectors, sector_id]
-        profile = core.save_profile(conn, profile)
-        return {**profile, "recommendations": [core.career_out(c, set(core.saved_ids(conn)))
-                                                for c in core.recommendations(profile)]}
+        profile = core.save_profile(conn, user["id"], profile)
+        saved = set(core.saved_ids(conn, user["id"]))
+        return {**profile, "recommendations": [core.career_out(c, saved) for c in core.recommendations(profile)]}
 
 
 # --------------------------------------------------------------------------- #
 # Saved careers
 # --------------------------------------------------------------------------- #
 @app.get("/api/saved")
-def list_saved():
+def list_saved(user: dict = Depends(current_user)):
     with core.db() as conn:
-        ids = core.saved_ids(conn)
+        ids = core.saved_ids(conn, user["id"])
     return [core.career_out(core.CAREER_BY_ID[i], set(ids)) for i in ids if i in core.CAREER_BY_ID]
 
 
 @app.put("/api/saved/{career_id}")
-def save_career(career_id: str):
+def save_career(career_id: str, user: dict = Depends(current_user)):
     if career_id not in core.CAREER_BY_ID:
         raise HTTPException(404, "Career not found")
     with core.db() as conn:
-        conn.execute("INSERT OR IGNORE INTO saved (career_id, created_at) VALUES (?, ?)",
-                     (career_id, core._now()))
-        return {"career_id": career_id, "saved": True, "saved_count": len(core.saved_ids(conn))}
+        core.save_career(conn, user["id"], career_id)
+        return {"career_id": career_id, "saved": True, "saved_count": len(core.saved_ids(conn, user["id"]))}
 
 
 @app.delete("/api/saved/{career_id}")
-def unsave_career(career_id: str):
+def unsave_career(career_id: str, user: dict = Depends(current_user)):
     with core.db() as conn:
-        conn.execute("DELETE FROM saved WHERE career_id = ?", (career_id,))
-        return {"career_id": career_id, "saved": False, "saved_count": len(core.saved_ids(conn))}
+        core.unsave_career(conn, user["id"], career_id)
+        return {"career_id": career_id, "saved": False, "saved_count": len(core.saved_ids(conn, user["id"]))}
 
 
 # --------------------------------------------------------------------------- #
 # Advice history + AI advisor
 # --------------------------------------------------------------------------- #
 @app.get("/api/advice")
-def list_advice():
+def list_advice(user: dict = Depends(current_user)):
     with core.db() as conn:
-        return core.list_advice(conn)
+        return core.list_advice(conn, user["id"])
 
 
 @app.delete("/api/advice/{advice_id}")
-def delete_advice(advice_id: int):
+def delete_advice(advice_id: int, user: dict = Depends(current_user)):
     with core.db() as conn:
-        cur = conn.execute("DELETE FROM advice WHERE id = ?", (advice_id,))
-        if cur.rowcount == 0:
+        if not core.delete_advice(conn, user["id"], advice_id):
             raise HTTPException(404, "Advice not found")
         return {"deleted": advice_id}
 
 
 @app.post("/api/chat")
-def chat(body: ChatIn):
+def chat(body: ChatIn, user: dict = Depends(current_user)):
     """Career advisor. Uses Claude when ANTHROPIC_API_KEY is set, otherwise the built-in rules."""
+    _limit(f"chat:{user['id']}", 30, 3600, "You’ve asked a lot of questions this hour. Please try again a little later.")
     with core.db() as conn:
-        profile = core.get_profile(conn)
+        profile = core.get_profile(conn, user["id"])
 
     history = [t.model_dump() for t in body.history]
     reply = core.llm_reply(body.message, history, profile)
@@ -231,8 +336,8 @@ def chat(body: ChatIn):
     advice = None
     with core.db() as conn:
         if body.save_advice:
-            advice = core.add_advice(conn, reply)
-        advice_count = conn.execute("SELECT COUNT(*) FROM advice").fetchone()[0]
+            advice = core.add_advice(conn, user["id"], reply)
+        advice_count = core.count_advice(conn, user["id"])
     return {"reply": reply, "source": source, "advice": advice, "advice_count": advice_count}
 
 
